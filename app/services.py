@@ -1,14 +1,18 @@
-"""领域服务：日历落库、可行性探测、方案采纳与重放。"""
+"""领域服务：日历落库、可行性探测、方案采纳与重放。
+
+读取既有日历/方案时统一经 :mod:`app.integrity` 做整版校验：损坏记录产生
+稳定的 422 数据异常，而不是 500 或静默挑选。探测、采纳、重放全程只读
+既有记录，不新增方案，也不改写任何日历、方案与见证。
+"""
 from __future__ import annotations
 
 import json
 import uuid
 
 from fastapi import HTTPException
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import scheduling
+from . import integrity, scheduling
 from .database import CalendarRow, GateRow, PlanRow
 from .schemas import CalendarIn, PlanIn, VoyageIn
 
@@ -18,7 +22,7 @@ def _new_id() -> str:
 
 
 def create_calendar(db: Session, payload: CalendarIn) -> CalendarRow:
-    """整版原子写入：任一异常则全部不落库。"""
+    """整版原子写入：请求体已由 schemas 整版校验，任一异常则全部不落库。"""
     cal = CalendarRow(id=_new_id())
     db.add(cal)
     for pos, gate in enumerate(payload.gates):
@@ -35,39 +39,25 @@ def create_calendar(db: Session, payload: CalendarIn) -> CalendarRow:
     return cal
 
 
-def get_calendar(db: Session, calendar_id: str) -> CalendarRow:
-    cal = db.get(CalendarRow, calendar_id)
-    if cal is None:
-        raise HTTPException(status_code=404, detail="日历不存在")
-    return cal
-
-
-def _load_gate_map(db: Session, calendar_id: str) -> dict[str, GateRow]:
-    get_calendar(db, calendar_id)
-    rows = db.scalars(
-        select(GateRow).where(GateRow.calendar_id == calendar_id)
-    ).all()
-    return {r.gate_id: r for r in rows}
-
-
-def _window_arrays(
-    gate_map: dict[str, GateRow], gate_ids: list[str]
+def _windows_for_gate(
+    stored: list[integrity.StoredGate], gate_ids: list[str]
 ) -> list[tuple[list[int], list[int]]]:
+    by_id = {g.gate_id: g for g in stored}
     windows_by_gate: list[tuple[list[int], list[int]]] = []
     for gid in gate_ids:
-        row = gate_map.get(gid)
-        if row is None:
+        gate = by_id.get(gid)
+        if gate is None:
             raise HTTPException(status_code=422, detail=f"闸门 {gid!r} 不在日历中")
-        windows = json.loads(row.windows)
-        starts = [w[0] for w in windows]
-        ends = [w[1] for w in windows]
-        windows_by_gate.append((starts, ends))
+        windows = gate.windows
+        windows_by_gate.append(
+            ([w[0] for w in windows], [w[1] for w in windows])
+        )
     return windows_by_gate
 
 
 def probe(db: Session, voyage: VoyageIn) -> list[list[int]]:
-    gate_map = _load_gate_map(db, voyage.calendar_id)
-    windows_by_gate = _window_arrays(gate_map, voyage.gates)
+    stored = integrity.load_calendar(db, voyage.calendar_id)
+    windows_by_gate = _windows_for_gate(stored, voyage.gates)
     return scheduling.feasible_departures(
         list(voyage.legs),
         list(voyage.max_waits),
@@ -76,9 +66,7 @@ def probe(db: Session, voyage: VoyageIn) -> list[list[int]]:
     )
 
 
-def _witnesses(
-    gate_ids: list[str], trace: scheduling.Trace
-) -> list[dict]:
+def _witnesses(gate_ids: list[str], trace: scheduling.Trace) -> list[dict]:
     return [
         {
             "gate_id": gate_ids[i],
@@ -91,8 +79,8 @@ def _witnesses(
 
 
 def adopt_plan(db: Session, payload: PlanIn) -> PlanRow:
-    gate_map = _load_gate_map(db, payload.calendar_id)
-    windows_by_gate = _window_arrays(gate_map, payload.gates)
+    stored = integrity.load_calendar(db, payload.calendar_id)
+    windows_by_gate = _windows_for_gate(stored, payload.gates)
     result = scheduling.forward_trace(
         payload.departure,
         list(payload.legs),
@@ -136,18 +124,19 @@ def adopt_plan(db: Session, payload: PlanIn) -> PlanRow:
 def replay_plan(
     db: Session, plan_id: str, new_calendar_id: str
 ) -> dict:
-    """在新日历上重放方案；只读，原方案不改写。"""
-    plan = db.get(PlanRow, plan_id)
-    if plan is None:
-        raise HTTPException(status_code=404, detail="方案不存在")
-    gate_map = _load_gate_map(db, new_calendar_id)
+    """在新日历上重放方案；只读，原方案不改写。
 
-    definition = json.loads(plan.payload)
+    既有方案（含航程定义与见证）与新日历都先经整版完整性校验，损坏记录
+    返回 422 数据异常；404 与合法的 INVALID/STILL_VALID 语义保持不变。
+    """
+    plan, definition, _ = integrity.load_plan(db, plan_id)
+    stored = integrity.load_calendar(db, new_calendar_id)
+
     gate_ids: list[str] = definition["gates"]
     windows_by_gate: list[tuple[list[int], list[int]]] = []
     for i, gid in enumerate(gate_ids):
-        row = gate_map.get(gid)
-        if row is None:
+        gate = next((g for g in stored if g.gate_id == gid), None)
+        if gate is None:
             return {
                 "status": "INVALID",
                 "failed_gate_id": gid,
@@ -156,9 +145,11 @@ def replay_plan(
                 "wait_deadline": None,
                 "reason": "GATE_NOT_IN_CALENDAR",
             }
-        windows = json.loads(row.windows)
         windows_by_gate.append(
-            ([w[0] for w in windows], [w[1] for w in windows])
+            (
+                [w[0] for w in gate.windows],
+                [w[1] for w in gate.windows],
+            )
         )
 
     result = scheduling.forward_trace(
@@ -188,8 +179,9 @@ def replay_plan(
     }
 
 
-def plan_to_dict(plan: PlanRow) -> dict:
-    definition = json.loads(plan.payload)
+def get_plan_dict(db: Session, plan_id: str) -> dict:
+    """读取既有方案（整版校验后）并转成 PlanOut 所需字典。"""
+    plan, definition, witnesses = integrity.load_plan(db, plan_id)
     return {
         "id": plan.id,
         "calendar_id": plan.calendar_id,
@@ -197,5 +189,5 @@ def plan_to_dict(plan: PlanRow) -> dict:
         "legs": definition["legs"],
         "max_waits": definition["max_waits"],
         "departure": plan.departure,
-        "witnesses": json.loads(plan.witnesses),
+        "witnesses": witnesses,
     }

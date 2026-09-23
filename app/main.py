@@ -1,16 +1,14 @@
 """FastAPI 应用：潮汐闸门航程调度。"""
 from __future__ import annotations
 
-import json
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import select
+from fastapi import Depends, FastAPI
 from sqlalchemy.orm import Session
 
-from . import services
-from .database import GateRow, PlanRow, SessionLocal, init_db
+from . import integrity, services
+from .database import SessionLocal, init_db
 from .schemas import (
     CalendarIn,
     CalendarOut,
@@ -50,15 +48,15 @@ def get_db():
         db.close()
 
 
-def _load_calendar_gates(db: Session, calendar_id: str) -> list[GateOut]:
-    rows = db.scalars(
-        select(GateRow)
-        .where(GateRow.calendar_id == calendar_id)
-        .order_by(GateRow.position)
-    ).all()
-    return [
-        GateOut(gate_id=r.gate_id, windows=json.loads(r.windows)) for r in rows
-    ]
+def _calendar_out(db: Session, calendar_id: str) -> CalendarOut:
+    """读取日历并整版校验；损坏记录返回稳定 422，而非矛盾详情或 500。"""
+    stored = integrity.load_calendar(db, calendar_id)
+    return CalendarOut(
+        id=calendar_id,
+        gates=[
+            GateOut(gate_id=g.gate_id, windows=g.windows) for g in stored
+        ],
+    )
 
 
 @app.get("/health")
@@ -71,17 +69,14 @@ def publish_calendar(
     payload: CalendarIn, db: Session = Depends(get_db)
 ) -> CalendarOut:
     cal = services.create_calendar(db, payload)
-    return CalendarOut(id=cal.id, gates=_load_calendar_gates(db, cal.id))
+    return _calendar_out(db, cal.id)
 
 
 @app.get("/calendars/{calendar_id}", response_model=CalendarOut)
 def read_calendar(
     calendar_id: str, db: Session = Depends(get_db)
 ) -> CalendarOut:
-    services.get_calendar(db, calendar_id)
-    return CalendarOut(
-        id=calendar_id, gates=_load_calendar_gates(db, calendar_id)
-    )
+    return _calendar_out(db, calendar_id)
 
 
 @app.post("/voyages/probe", response_model=ProbeResponse)
@@ -95,15 +90,12 @@ def probe_voyage(
 @app.post("/plans", response_model=PlanOut, status_code=201)
 def adopt_plan(payload: PlanIn, db: Session = Depends(get_db)) -> PlanOut:
     plan = services.adopt_plan(db, payload)
-    return PlanOut(**services.plan_to_dict(plan))
+    return PlanOut(**services.get_plan_dict(db, plan.id))
 
 
 @app.get("/plans/{plan_id}", response_model=PlanOut)
 def read_plan(plan_id: str, db: Session = Depends(get_db)) -> PlanOut:
-    plan = db.get(PlanRow, plan_id)
-    if plan is None:
-        raise HTTPException(status_code=404, detail="方案不存在")
-    return PlanOut(**services.plan_to_dict(plan))
+    return PlanOut(**services.get_plan_dict(db, plan_id))
 
 
 @app.post(

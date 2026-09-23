@@ -124,3 +124,35 @@ DATABASE_URL="sqlite://" python3 -m pytest -q
 - 日历、方案均不可变，系统不提供修改/删除接口；重放针对新日历进行。
 - 恰在窗口 `end` 到达判为关闭，会尝试后续窗口；无后续窗口即 `NO_OPEN_WINDOW`。
 - 窗口可相接（`[10,20)` 与 `[20,30)`），在 `20` 到达落入第二窗。
+
+## 升级/恢复后读取既有记录
+
+服务升级或从备份恢复后，调度员继续使用既有日历与方案。读取既有记录时
+会做**整版完整性校验**，任何损坏都返回 HTTP **422** 数据异常，而不是
+500、自相矛盾的详情或静默挑选某一行：
+
+```json
+{"detail": {"error": "DATA_ANOMALY", "type": "<稳定错误码>",
+            "message": "...", "...": "定位上下文"}}
+```
+
+- 日历异常类型：`CALENDAR_NO_GATES`、`CALENDAR_DUPLICATE_POSITION`、
+  `CALENDAR_DUPLICATE_GATE_ID`、`CALENDAR_GATE_WINDOWS_NOT_JSON`、
+  `CALENDAR_WINDOWS_MALFORMED`、`CALENDAR_WINDOW_OUT_OF_DOMAIN`、
+  `CALENDAR_WINDOW_INVERTED`、`CALENDAR_WINDOWS_OVERLAP`。
+- 方案异常类型：`PLAN_PAYLOAD_NOT_JSON`、`PLAN_DEFINITION_MALFORMED`、
+  `PLAN_WITNESSES_NOT_JSON`、`PLAN_WITNESSES_SHAPE_MALFORMED`、
+  `PLAN_WITNESS_MISMATCH`。
+
+同一响应体在重复查询与服务重启后保持一致；这些路径**只读**，不新增方案、
+不改写任何日历、方案与见证。新发布日历的整版原子 422 拒绝与上述旧记录
+数据异常相互区分（请求体校验错误不含 `DATA_ANOMALY` 标记）。
+
+真实 PostgreSQL 验收（预置坏数据、重复查询、重启服务、表内容逐项快照
+比对、合法旧记录跨日历重放）：
+
+```bash
+PG_ACCEPTANCE=1 \
+PG_ACCEPTANCE_URL="postgresql+psycopg://tide@localhost:5432/tide_acceptance" \
+python3 -m pytest tests/test_postgres_acceptance.py -s
+```
