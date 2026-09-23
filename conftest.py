@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 
-os.environ["DATABASE_URL"] = "sqlite://"
+# 默认使用内存 SQLite；显式提供 DATABASE_URL 时不覆盖（供真实 PG 验收）。
+os.environ.setdefault("DATABASE_URL", "sqlite://")
 
 import pytest
 from fastapi.testclient import TestClient

@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# verify-pg：在"真实 PostgreSQL"上运行升级/恢复完整性验收（tests_pg/）。
+#
+# 连接串来源（优先级从高到低）：
+#   1. 已设置 TIDE_PG_URL（例如 docker compose 起的库）；
+#   2. 本机已在运行的 postgres（pg_ctl/psql 在 PATH，可 initdb）；
+#   3. TIDE_PG_BIN 指定的 PostgreSQL 安装目录（含 bin/initdb）；
+#   4. 自动下载 zonky 嵌入式 PostgreSQL 二进制（linux x86_64/aarch64）。
+#
+# 自动起的库为临时实例（unix socket + 本地 TCP），脚本退出即清理。
+set -euo pipefail
+cd "$(dirname "$0")"
+export PYTHONPATH="$PWD"
+
+run_pytest() {
+  exec python3 -m pytest tests_pg/ -q "$@"
+}
+
+if [ -n "${TIDE_PG_URL:-}" ]; then
+  export TIDE_PG_URL
+  run_pytest "$@"
+fi
+
+pick_bin() {
+  local d
+  for d in "$@"; do
+    if [ -x "$d/bin/initdb" ]; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+
+PGDIR="$(pick_bin "${TIDE_PG_BIN:-/nonexistent}" /tmp/pg/pgsql /usr/lib/postgresql/*/bin/.. 2>/dev/null || true)"
+
+if [ -z "$PGDIR" ] && command -v initdb >/dev/null 2>&1; then
+  PGDIR="$(dirname "$(dirname "$(command -v initdb)")")"
+fi
+
+if [ -z "$PGDIR" ]; then
+  # 自动下载与平台匹配的 zonky 嵌入式二进制（PostgreSQL 16）。
+  case "$(uname -m)" in
+    x86_64|amd64) ART=linux-amd64 ;;
+    aarch64|arm64) ART=linux-arm64v8 ;;
+    *) echo "不支持的架构 $(uname -m)，请用 TIDE_PG_BIN 或 TIDE_PG_URL 指定真实 PostgreSQL" >&2; exit 2 ;;
+  esac
+  VER=16.15.0
+  WORK=/tmp/tide-pg-embed
+  mkdir -p "$WORK"
+  JAR="$WORK/pg.jar"
+  URL="https://repo1.maven.org/maven2/io/zonky/test/postgres/embedded-postgres-binaries-${ART}/${VER}/embedded-postgres-binaries-${ART}-${VER}.jar"
+  if [ ! -x "$WORK/pgsql/bin/initdb" ]; then
+    echo "下载嵌入式 PostgreSQL: $URL" >&2
+    curl -fsSL "$URL" -o "$JAR"
+    python3 - "$JAR" "$WORK" <<'PY'
+import sys, zipfile
+jar, work = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(jar) as z:
+    member = next(n for n in z.namelist() if n.endswith(".txz"))
+    z.extract(member, work)
+PY
+    mkdir -p "$WORK/pgsql"
+    tar -xf "$WORK"/postgres-*.txz -C "$WORK/pgsql"
+  fi
+  PGDIR="$WORK/pgsql"
+fi
+
+echo "使用 PostgreSQL: $PGDIR" >&2
+DATA="$(mktemp -d)"
+SOCK="$DATA/sock"
+PORT="${TIDE_PG_PORT:-55432}"
+trap '$PGDIR/bin/pg_ctl -D "$DATA" stop -m immediate >/dev/null 2>&1 || true; rm -rf "$DATA"' EXIT
+
+"$PGDIR/bin/initdb" -D "$DATA" -U tide --auth=trust -E UTF8 >/dev/null
+mkdir -p "$SOCK"
+"$PGDIR/bin/pg_ctl" -D "$DATA" -o "-p $PORT -k $SOCK -c listen_addresses=127.0.0.1" -l "$DATA/server.log" start >/dev/null
+for _ in $(seq 1 50); do
+  python3 - "$PORT" <<'PY' && break || true
+import sys, psycopg
+psycopg.connect(f"host=127.0.0.1 port={sys.argv[1]} user=tide dbname=postgres").close()
+PY
+  sleep 0.2
+done
+python3 - "$PORT" <<'PY'
+import sys, psycopg
+c = psycopg.connect(f"host=127.0.0.1 port={sys.argv[1]} user=tide dbname=postgres")
+c.autocommit = True
+with c.cursor() as cur:
+    cur.execute("SELECT 1 FROM pg_database WHERE datname='tide'")
+    if cur.fetchone() is None:
+        cur.execute("CREATE DATABASE tide")
+PY
+
+export TIDE_PG_URL="postgresql+psycopg://tide@127.0.0.1:$PORT/tide"
+python3 -m pytest tests_pg/ -q "$@"

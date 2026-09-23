@@ -1,26 +1,28 @@
 """FastAPI 应用：潮汐闸门航程调度。"""
 from __future__ import annotations
 
-import json
+import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import select
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from . import services
-from .database import GateRow, PlanRow, SessionLocal, init_db
+from .database import PlanRow, SessionLocal, init_db
+from .integrity import CalendarCorrupt, PlanCorrupt
 from .schemas import (
     CalendarIn,
     CalendarOut,
-    GateOut,
     PlanIn,
     PlanOut,
     ProbeResponse,
     ReplayResponse,
     VoyageIn,
 )
+
+logger = logging.getLogger("tide")
 
 
 @asynccontextmanager
@@ -42,23 +44,51 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="潮汐闸门航程调度 API", version="1.0.0", lifespan=lifespan)
 
 
+@app.exception_handler(CalendarCorrupt)
+async def calendar_corrupt_handler(
+    request: Request, exc: CalendarCorrupt
+) -> JSONResponse:
+    """持久化日历不满足域约束：稳定可区分的 500 数据异常，绝不静默挑选。"""
+    logger.error("日历数据异常 %s: %s", exc.calendar_id, exc.reason)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": {
+                "error": "CORRUPT_CALENDAR_DATA",
+                "calendar_id": exc.calendar_id,
+                "reason": exc.reason,
+                "gate_id": exc.gate_id,
+                "position": exc.position,
+            }
+        },
+    )
+
+
+@app.exception_handler(PlanCorrupt)
+async def plan_corrupt_handler(
+    request: Request, exc: PlanCorrupt
+) -> JSONResponse:
+    """持久化方案的航程定义或见证损坏：稳定可区分的 500 数据异常。"""
+    logger.error("方案数据异常 %s: %s", exc.plan_id, exc.reason)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": {
+                "error": "CORRUPT_PLAN_DATA",
+                "plan_id": exc.plan_id,
+                "reason": exc.reason,
+                "field": exc.field,
+            }
+        },
+    )
+
+
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-
-def _load_calendar_gates(db: Session, calendar_id: str) -> list[GateOut]:
-    rows = db.scalars(
-        select(GateRow)
-        .where(GateRow.calendar_id == calendar_id)
-        .order_by(GateRow.position)
-    ).all()
-    return [
-        GateOut(gate_id=r.gate_id, windows=json.loads(r.windows)) for r in rows
-    ]
 
 
 @app.get("/health")
@@ -71,16 +101,18 @@ def publish_calendar(
     payload: CalendarIn, db: Session = Depends(get_db)
 ) -> CalendarOut:
     cal = services.create_calendar(db, payload)
-    return CalendarOut(id=cal.id, gates=_load_calendar_gates(db, cal.id))
+    return CalendarOut(
+        id=cal.id, gates=services.validated_calendar_out(db, cal.id)
+    )
 
 
 @app.get("/calendars/{calendar_id}", response_model=CalendarOut)
 def read_calendar(
     calendar_id: str, db: Session = Depends(get_db)
 ) -> CalendarOut:
-    services.get_calendar(db, calendar_id)
     return CalendarOut(
-        id=calendar_id, gates=_load_calendar_gates(db, calendar_id)
+        id=calendar_id,
+        gates=services.validated_calendar_out(db, calendar_id),
     )
 
 

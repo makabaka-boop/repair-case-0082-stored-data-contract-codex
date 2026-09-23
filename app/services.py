@@ -1,4 +1,10 @@
-"""领域服务：日历落库、可行性探测、方案采纳与重放。"""
+"""领域服务：日历落库、可行性探测、方案采纳与重放。
+
+读取既有记录（升级/恢复前写入）时一律先经 :mod:`app.integrity` 校验：
+合法旧记录行为与升级前完全一致；结构损坏、重复身份或顺序冲突抛出
+``CalendarCorrupt`` / ``PlanCorrupt``，由路由层转成稳定的 500 数据异常，
+绝不静默挑选记录，也不在任何失败路径上新增或改写数据。
+"""
 from __future__ import annotations
 
 import json
@@ -8,7 +14,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import scheduling
+from . import integrity, scheduling
 from .database import CalendarRow, GateRow, PlanRow
 from .schemas import CalendarIn, PlanIn, VoyageIn
 
@@ -18,7 +24,7 @@ def _new_id() -> str:
 
 
 def create_calendar(db: Session, payload: CalendarIn) -> CalendarRow:
-    """整版原子写入：任一异常则全部不落库。"""
+    """整版原子写入：请求体已由 schema 整版校验，任一异常则全部不落库。"""
     cal = CalendarRow(id=_new_id())
     db.add(cal)
     for pos, gate in enumerate(payload.gates):
@@ -42,32 +48,47 @@ def get_calendar(db: Session, calendar_id: str) -> CalendarRow:
     return cal
 
 
-def _load_gate_map(db: Session, calendar_id: str) -> dict[str, GateRow]:
+def _load_validated_gates(
+    db: Session, calendar_id: str
+) -> list[integrity.ValidatedGate]:
+    """日历存在性（404）之后做整日历结构校验（损坏 -> CalendarCorrupt）。"""
     get_calendar(db, calendar_id)
     rows = db.scalars(
         select(GateRow).where(GateRow.calendar_id == calendar_id)
     ).all()
-    return {r.gate_id: r for r in rows}
+    return integrity.validate_calendar_rows(calendar_id, list(rows))
 
 
 def _window_arrays(
-    gate_map: dict[str, GateRow], gate_ids: list[str]
+    gates: list[integrity.ValidatedGate], gate_ids: list[str]
 ) -> list[tuple[list[int], list[int]]]:
+    by_id = {g.gate_id: g for g in gates}
     windows_by_gate: list[tuple[list[int], list[int]]] = []
     for gid in gate_ids:
-        row = gate_map.get(gid)
-        if row is None:
+        gate = by_id.get(gid)
+        if gate is None:
+            # 日历本身合法，仅是本次航程引用了不存在的闸门 -> 422（既有语义）。
             raise HTTPException(status_code=422, detail=f"闸门 {gid!r} 不在日历中")
-        windows = json.loads(row.windows)
-        starts = [w[0] for w in windows]
-        ends = [w[1] for w in windows]
+        starts = [s for s, _e in gate.windows]
+        ends = [e for _s, e in gate.windows]
         windows_by_gate.append((starts, ends))
     return windows_by_gate
 
 
+def validated_calendar_out(
+    db: Session, calendar_id: str
+) -> list[dict]:
+    """供日历详情使用：校验后按 position 稳定输出。"""
+    gates = _load_validated_gates(db, calendar_id)
+    return [
+        {"gate_id": g.gate_id, "windows": [[s, e] for s, e in g.windows]}
+        for g in gates
+    ]
+
+
 def probe(db: Session, voyage: VoyageIn) -> list[list[int]]:
-    gate_map = _load_gate_map(db, voyage.calendar_id)
-    windows_by_gate = _window_arrays(gate_map, voyage.gates)
+    gates = _load_validated_gates(db, voyage.calendar_id)
+    windows_by_gate = _window_arrays(gates, voyage.gates)
     return scheduling.feasible_departures(
         list(voyage.legs),
         list(voyage.max_waits),
@@ -91,8 +112,8 @@ def _witnesses(
 
 
 def adopt_plan(db: Session, payload: PlanIn) -> PlanRow:
-    gate_map = _load_gate_map(db, payload.calendar_id)
-    windows_by_gate = _window_arrays(gate_map, payload.gates)
+    gates = _load_validated_gates(db, payload.calendar_id)
+    windows_by_gate = _window_arrays(gates, payload.gates)
     result = scheduling.forward_trace(
         payload.departure,
         list(payload.legs),
@@ -133,21 +154,33 @@ def adopt_plan(db: Session, payload: PlanIn) -> PlanRow:
     return plan
 
 
-def replay_plan(
-    db: Session, plan_id: str, new_calendar_id: str
-) -> dict:
-    """在新日历上重放方案；只读，原方案不改写。"""
+def _load_validated_plan(db: Session, plan_id: str) -> tuple[PlanRow, integrity.ValidatedPlan]:
     plan = db.get(PlanRow, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="方案不存在")
-    gate_map = _load_gate_map(db, new_calendar_id)
+    snapshot = integrity.validate_plan_snapshot(
+        plan_id, plan.payload, plan.witnesses, plan.departure
+    )
+    return plan, snapshot
 
-    definition = json.loads(plan.payload)
-    gate_ids: list[str] = definition["gates"]
+
+def replay_plan(
+    db: Session, plan_id: str, new_calendar_id: str
+) -> dict:
+    """在新日历上重放方案；只读，原方案不改写。
+
+    方案快照先校验（损坏 -> PlanCorrupt 500），再加载并校验新日历
+    （损坏 -> CalendarCorrupt 500）；结论确定，与行序、重启无关。
+    """
+    plan, snapshot = _load_validated_plan(db, plan_id)
+    gates = _load_validated_gates(db, new_calendar_id)
+
+    gate_ids = snapshot.gates
+    by_id = {g.gate_id: g for g in gates}
     windows_by_gate: list[tuple[list[int], list[int]]] = []
     for i, gid in enumerate(gate_ids):
-        row = gate_map.get(gid)
-        if row is None:
+        gate = by_id.get(gid)
+        if gate is None:
             return {
                 "status": "INVALID",
                 "failed_gate_id": gid,
@@ -156,15 +189,14 @@ def replay_plan(
                 "wait_deadline": None,
                 "reason": "GATE_NOT_IN_CALENDAR",
             }
-        windows = json.loads(row.windows)
         windows_by_gate.append(
-            ([w[0] for w in windows], [w[1] for w in windows])
+            ([s for s, _e in gate.windows], [e for _s, e in gate.windows])
         )
 
     result = scheduling.forward_trace(
         plan.departure,
-        definition["legs"],
-        definition["max_waits"],
+        snapshot.legs,
+        snapshot.max_waits,
         windows_by_gate,
     )
     if isinstance(result, scheduling.Trace):
@@ -183,19 +215,21 @@ def replay_plan(
         "failed_gate_id": gate_ids[i],
         "failed_index": i,
         "arrival": result.arrival,
-        "wait_deadline": result.arrival + definition["max_waits"][i],
+        "wait_deadline": result.arrival + snapshot.max_waits[i],
         "reason": result.reason,
     }
 
 
 def plan_to_dict(plan: PlanRow) -> dict:
-    definition = json.loads(plan.payload)
+    snapshot = integrity.validate_plan_snapshot(
+        plan.id, plan.payload, plan.witnesses, plan.departure
+    )
     return {
         "id": plan.id,
         "calendar_id": plan.calendar_id,
-        "gates": definition["gates"],
-        "legs": definition["legs"],
-        "max_waits": definition["max_waits"],
+        "gates": snapshot.gates,
+        "legs": snapshot.legs,
+        "max_waits": snapshot.max_waits,
         "departure": plan.departure,
-        "witnesses": json.loads(plan.witnesses),
+        "witnesses": snapshot.witnesses,
     }

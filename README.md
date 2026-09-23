@@ -8,6 +8,8 @@
 - 数据库：PostgreSQL（不可变日历 + 采纳方案）
 - 部署：Docker Compose（API + 数据库），宿主机端口由 `API_PORT` 配置
 - 测试：`./verify` 执行 pytest（算法穷举一致性 + API + 二十万窗口 ≤ 3 秒）
+- 升级/恢复完整性验收：`./verify-pg` 在**真实 PostgreSQL** 中预置损坏/旧记录，
+  重复查询并真实重启服务核对（自动准备本地 PG；也可用 `TIDE_PG_URL` 指定现有库）
 
 ## 规则要点
 
@@ -42,6 +44,33 @@ API_PORT=8080 docker compose up --build
 ./verify          # 需要本机 Python 3 且已安装 requirements-dev.txt
 # 或
 DATABASE_URL="sqlite://" python3 -m pytest -q
+```
+
+升级/从备份恢复后，调度员可能继续使用旧版本写入的日历与方案。读取任何既有
+记录前，服务都会先做结构完整性校验：
+
+- 合法旧记录：区间、见证、重放结论与升级前**逐字段一致**。
+- 结构损坏、重复身份或顺序冲突：日历读 / 探测 / 采纳 / 方案读 / 重放统一
+  返回 **HTTP 500** 数据异常（绝不静默挑选记录、绝不返回不确定的内部异常），
+  且**不新增方案、不改写任何既有日历/方案/见证**。
+
+```json
+{"detail": {"error": "CORRUPT_CALENDAR_DATA", "calendar_id": "…",
+            "reason": "DUPLICATE_GATE_ID", "gate_id": "G1", "position": null}}
+```
+
+日历 `reason`：`DUPLICATE_GATE_ID` / `DUPLICATE_POSITION` / `GATE_ID_INVALID`
+/ `POSITION_INVALID` / `GATE_WINDOWS_NOT_JSON` / `GATE_WINDOWS_SHAPE`
+/ `GATE_WINDOWS_OUT_OF_RANGE` / `GATE_WINDOW_INVERTED` /
+`GATE_WINDOWS_OVERLAP` / `CALENDAR_HAS_NO_GATES`；
+方案 `reason`：`PLAN_PAYLOAD_NOT_JSON` / `PLAN_PAYLOAD_SHAPE` /
+`PLAN_WITNESSES_NOT_JSON` / `PLAN_WITNESSES_SHAPE`，错误体为
+`{"error": "CORRUPT_PLAN_DATA", "plan_id": "…", "reason": "…", "field": …}`。
+
+```bash
+./verify-pg        # 真实 PostgreSQL 验收（重复查询 + 真实重启 + 表内容逐项不变）
+# 也可对已在运行的库执行：
+TIDE_PG_URL="postgresql+psycopg://tide:tide@localhost:5432/tide" ./verify-pg
 ```
 
 ## 请求示例
